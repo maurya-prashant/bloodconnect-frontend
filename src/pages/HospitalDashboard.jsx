@@ -1,518 +1,261 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// HospitalDashboard.jsx
-//
-// The main page for a logged-in hospital user.
-// Responsibilities:
-//   1. Show a summary of all blood requests raised by this hospital
-//   2. Allow the hospital to raise a new blood request
-//   3. Allow the hospital to cancel a pending request
-//
-// Flow:
-//   Hospital fills the form → POST /hospital/{id}/request
-//   → Backend finds eligible donors within radiusKm using Haversine formula
-//   → Donors get email notifications
-//   → Hospital sees updated request list with status badges
-// ─────────────────────────────────────────────────────────────────────────────
-
 import { useState, useEffect } from 'react'
-import api from '../api/axios'
 import { useAuth } from '../context/AuthContext'
+import { useNavigate, Link } from 'react-router-dom'
+import api from '../api/axios'
+import Sidebar from '../components/Sidebar'
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+const URGENCY_COLORS = {
+  HIGH:   'bg-red-50 text-red-600 border-red-200',
+  MEDIUM: 'bg-orange-50 text-orange-600 border-orange-200',
+  LOW:    'bg-gray-50 text-gray-500 border-gray-200',
+}
 
-// All 8 blood types — must match the backend BloodType enum exactly
-const BLOOD_TYPES = [
-  'A_POSITIVE',  'A_NEGATIVE',
-  'B_POSITIVE',  'B_NEGATIVE',
-  'AB_POSITIVE', 'AB_NEGATIVE',
-  'O_POSITIVE',  'O_NEGATIVE',
-]
+const STATUS_COLORS = {
+  PENDING:   'bg-blue-50 text-blue-600 border-blue-200',
+  FULFILLED: 'bg-green-50 text-green-600 border-green-200',
+  CANCELLED: 'bg-gray-50 text-gray-400 border-gray-200',
+}
 
-// Urgency levels — must match the backend UrgencyLevel enum exactly
-const URGENCY_LEVELS = ['LOW', 'MEDIUM', 'HIGH']
-
-// Slider range constants — makes the math readable and easy to change
-const RADIUS_MIN     = 1   // km
-const RADIUS_MAX     = 20  // km
-const RADIUS_DEFAULT = 5   // km
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/**
- * Converts a blood type enum string to a short display label.
- * Used inside the blood type badge on each request card.
- *
- * Examples:
- *   AB_POSITIVE → AB+
- *   O_NEGATIVE  → O−
- *   B_POSITIVE  → B+
- */
-const btShort = (bt) =>
-  bt.replace('_POSITIVE', '+').replace('_NEGATIVE', '−').replace('_', '')
-
-/**
- * Converts a slider value to a percentage position along the track.
- * Used to align the scale labels (1km / 5km / 10km / 20km) directly
- * under their correct position on the slider.
- *
- * Formula: (value - min) / (max - min) * 100
- * Examples with min=1 max=20:
- *   value=1  → 0%
- *   value=5  → 21%
- *   value=10 → 47%
- *   value=20 → 100%
- */
-const sliderPercent = (value) =>
-  ((value - RADIUS_MIN) / (RADIUS_MAX - RADIUS_MIN)) * 100
-
-/**
- * Returns a Tailwind CSS class string for the urgency badge color.
- * HIGH   → red
- * MEDIUM → yellow
- * LOW    → green
- */
-const urgencyColor = (urgency) => ({
-  HIGH:   'bg-red-100 text-red-800',
-  MEDIUM: 'bg-yellow-100 text-yellow-800',
-  LOW:    'bg-green-100 text-green-700',
-})[urgency] ?? 'bg-gray-100 text-gray-600'
-
-/**
- * Returns a Tailwind CSS class string for the status badge color.
- * PENDING   → yellow
- * FULFILLED → green
- * CANCELLED → gray
- */
-const statusColor = (status) => ({
-  PENDING:   'bg-yellow-100 text-yellow-800',
-  FULFILLED: 'bg-green-100 text-green-700',
-  CANCELLED: 'bg-gray-100 text-gray-500',
-})[status] ?? 'bg-gray-100 text-gray-500'
-
-// ─── Component ───────────────────────────────────────────────────────────────
+const BLOOD_TYPES = ['A_POSITIVE','A_NEGATIVE','B_POSITIVE','B_NEGATIVE','AB_POSITIVE','AB_NEGATIVE','O_POSITIVE','O_NEGATIVE']
+const formatBlood = b => b.replace('_POSITIVE', '+').replace('_NEGATIVE', '-').replace('_', '')
+const formatDate  = d => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
 
 export default function HospitalDashboard() {
-
-  // useAuth gives us the logged-in hospital's id, name, role from the JWT context
-  const { user } = useAuth()
-
-  // Full list of blood requests raised by this hospital, fetched from backend
+  const { user, logout } = useAuth()
+  const navigate = useNavigate()
   const [requests, setRequests] = useState([])
-
-  // Whether the "New Blood Request" form is visible
+  const [loading, setLoading] = useState(true)
   const [showForm, setShowForm] = useState(false)
-
-  // Feedback message shown after raise/cancel actions
-  // e.g. "✅ Request raised!" or "❌ Failed to raise request"
-  const [message, setMessage] = useState('')
-
-  // Form state — these fields map 1:1 to the BloodRequestDTO sent to backend
+  const [submitting, setSubmitting] = useState(false)
+  const [cancelling, setCancelling] = useState(null)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
   const [form, setForm] = useState({
-    bloodType:    'A_POSITIVE',    // which blood type the hospital needs
-    urgencyLevel: 'HIGH',          // how urgent the request is
-    unitsNeeded:  1,               // number of blood units needed
-    notes:        '',              // optional extra info for donors
-    radiusKm:     RADIUS_DEFAULT,  // search radius — donors within this distance get notified
+    bloodType: 'A_POSITIVE',
+    urgencyLevel: 'MEDIUM',
+    unitsNeeded: 1,
+    radiusKm: 5,
+    notes: ''
   })
 
-  // ─── Data Fetching ──────────────────────────────────────────────────────────
+  useEffect(() => { fetchRequests() }, [])
 
-  /**
-   * Fetches all blood requests for this hospital from the backend.
-   * Called on mount and after every raise/cancel action to keep the list fresh.
-   *
-   * GET /hospital/{id}/requests
-   * Returns: BloodRequest[]
-   */
   const fetchRequests = async () => {
     try {
       const res = await api.get(`/hospital/${user.id}/requests`)
       setRequests(res.data)
     } catch (err) {
-      console.error('Failed to fetch requests:', err)
+      console.error(err)
+    } finally {
+      setLoading(false)
     }
   }
 
-  // Fetch on initial page load
-  useEffect(() => {
-    fetchRequests()
-  }, [])
+  const handleChange = e => setForm({ ...form, [e.target.name]: e.target.value })
 
-  // ─── Actions ────────────────────────────────────────────────────────────────
-
-  /**
-   * Submits a new blood request to the backend.
-   *
-   * POST /hospital/{id}/request
-   * Body: BloodRequestDTO { bloodType, urgencyLevel, unitsNeeded, notes, radiusKm }
-   *
-   * On success:
-   *   - Backend triggers donor matching + email notifications
-   *   - Form is hidden
-   *   - Request list is refreshed
-   *   - Success message is shown for 4 seconds
-   */
-  const handleSubmit = async (e) => {
+  const handleSubmit = async e => {
     e.preventDefault()
+    setError('')
+    setSuccess('')
+    setSubmitting(true)
     try {
-      await api.post(`/hospital/${user.id}/request`, form)
-      setMessage('✅ Request raised! Donors are being notified.')
+      await api.post(`/hospital/${user.id}/request`, {
+        ...form,
+        unitsNeeded: parseInt(form.unitsNeeded),
+        radiusKm: parseFloat(form.radiusKm),
+      })
+      setSuccess('Blood request raised! Matching donors are being notified.')
       setShowForm(false)
-      fetchRequests()
-      setTimeout(() => setMessage(''), 4000)
-    } catch {
-      setMessage('❌ Failed to raise request. Please try again.')
+      setForm({ bloodType: 'A_POSITIVE', urgencyLevel: 'MEDIUM', unitsNeeded: 1, radiusKm: 5, notes: '' })
+      await fetchRequests()
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to raise request.')
+    } finally {
+      setSubmitting(false)
     }
   }
 
-  /**
-   * Cancels a PENDING blood request.
-   * Only PENDING requests can be cancelled — FULFILLED ones are locked.
-   *
-   * PUT /hospital/{id}/request/{requestId}/cancel
-   * On success: refreshes the list, shows success message for 3 seconds
-   */
-  const cancelRequest = async (requestId) => {
+  const cancelRequest = async (rid) => {
+    setCancelling(rid)
     try {
-      await api.put(`/hospital/${user.id}/request/${requestId}/cancel`)
-      setMessage('✅ Request cancelled.')
-      fetchRequests()
-      setTimeout(() => setMessage(''), 3000)
-    } catch {
-      setMessage('❌ Failed to cancel request.')
+      await api.put(`/hospital/${user.id}/request/${rid}/cancel`)
+      await fetchRequests()
+    } catch (err) {
+      console.error(err)
+    } finally {
+      setCancelling(null)
     }
   }
 
-  /**
-   * Resets the form back to its default values.
-   * Called when the hospital clicks "Cancel" on the form.
-   */
-  const resetForm = () => {
-    setForm({
-      bloodType:    'A_POSITIVE',
-      urgencyLevel: 'HIGH',
-      unitsNeeded:  1,
-      notes:        '',
-      radiusKm:     RADIUS_DEFAULT,
-    })
-    setShowForm(false)
-  }
+  const handleLogout = () => { logout(); navigate('/login') }
 
-  // ─── Derived Stats ──────────────────────────────────────────────────────────
-
-  // Count requests by status for the summary cards at the top
-  const stats = {
+  const counts = {
     total:     requests.length,
     pending:   requests.filter(r => r.status === 'PENDING').length,
     fulfilled: requests.filter(r => r.status === 'FULFILLED').length,
     cancelled: requests.filter(r => r.status === 'CANCELLED').length,
   }
 
-  // ─── Render ─────────────────────────────────────────────────────────────────
-
   return (
-    <div className="p-6 w-full">
+    <div className="min-h-screen bg-gray-50 flex">
+      <Sidebar />
+      <main className="flex-1 lg:ml-64 pt-20 lg:pt-8 px-4 lg:px-8 py-8">
 
-      {/* ── Page Header ─────────────────────────────────────────────────────── */}
-      {/*    Left: title + today's date   Right: "Raise Request" toggle button  */}
-      <div className="flex justify-between items-center mb-6">
-        <div>
-          <h1 className="text-xl font-medium text-gray-900">Blood Requests</h1>
-          <p className="text-sm text-gray-500 mt-0.5">
-            {new Date().toLocaleDateString('en-IN', {
-              weekday: 'long',
-              year:    'numeric',
-              month:   'long',
-              day:     'numeric',
-            })}
-          </p>
-        </div>
-
-        {/* Clicking this toggles the New Request form below */}
-        <button
-          onClick={() => setShowForm(prev => !prev)}
-          className="flex items-center gap-2 bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-red-700 transition"
-        >
-          <span className="text-base leading-none">+</span>
-          Raise Request
-        </button>
-      </div>
-
-      {/* ── Feedback Message ────────────────────────────────────────────────── */}
-      {/*    Shown after raise or cancel actions, auto-clears after a few seconds */}
-      {message && (
-        <div className="mb-4 text-sm px-4 py-2.5 bg-white border border-gray-200 rounded-lg text-gray-700">
-          {message}
-        </div>
-      )}
-
-      {/* ── New Blood Request Form ───────────────────────────────────────────── */}
-      {/*    Only rendered when showForm is true (toggled by the header button)  */}
-      {showForm && (
-        <div className="bg-white border border-gray-200 rounded-xl p-5 mb-6">
-          <h2 className="text-sm font-medium text-gray-700 mb-4">New Blood Request</h2>
-
-          <form onSubmit={handleSubmit} className="grid grid-cols-2 gap-4">
-
-            {/* Blood Type ── which blood type the hospital needs */}
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Blood Type</label>
-              <select
-                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-300"
-                value={form.bloodType}
-                onChange={e => setForm({ ...form, bloodType: e.target.value })}
-              >
-                {BLOOD_TYPES.map(bt => (
-                  <option key={bt} value={bt}>{bt}</option>
-                ))}
-              </select>
-            </div>
-
-            {/* Urgency Level ── how critical the need is */}
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Urgency</label>
-              <select
-                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-300"
-                value={form.urgencyLevel}
-                onChange={e => setForm({ ...form, urgencyLevel: e.target.value })}
-              >
-                {URGENCY_LEVELS.map(u => (
-                  <option key={u} value={u}>{u}</option>
-                ))}
-              </select>
-            </div>
-
-            {/* Units Needed ── how many blood units are required */}
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Units Needed</label>
-              <input
-                type="number"
-                min="1"
-                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-300"
-                value={form.unitsNeeded}
-                onChange={e => setForm({ ...form, unitsNeeded: parseInt(e.target.value) })}
-              />
-            </div>
-
-            {/* Notes ── optional message visible to donors */}
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Notes (optional)</label>
-              <input
-                type="text"
-                placeholder="e.g. Required for surgery at 3pm"
-                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-300"
-                value={form.notes}
-                onChange={e => setForm({ ...form, notes: e.target.value })}
-              />
-            </div>
-
-            {/* ── Search Radius Slider ───────────────────────────────────────── */}
-            {/*                                                                   */}
-            {/*   Controls how far to search for eligible donors.                */}
-            {/*   This value (radiusKm) is sent to the backend.                  */}
-            {/*   Backend uses the Haversine formula to check each donor's       */}
-            {/*   distance from the hospital and only notifies those within       */}
-            {/*   this radius.                                                    */}
-            {/*                                                                   */}
-            {/*   Range: 1km → 20km   Default: 5km                               */}
-            {/*                                                                   */}
-            {/*   Scale label positioning:                                        */}
-            {/*   Labels are placed using absolute % positions, NOT justify-      */}
-            {/*   between, because the range is 1–20 (not 0–20), so equal        */}
-            {/*   spacing would put labels in the wrong place visually.           */}
-            {/*                                                                   */}
-            {/*   Formula: (value - min) / (max - min) * 100                     */}
-            {/*     1km  → 0%    (left edge)                                      */}
-            {/*     5km  → 21%   ((5-1)/(20-1)*100)                              */}
-            {/*     10km → 47%   ((10-1)/(20-1)*100)                             */}
-            {/*     20km → 100%  (right edge)                                    */}
-            {/* ────────────────────────────────────────────────────────────────  */}
-            <div className="col-span-2">
-              <label className="block text-xs text-gray-500 mb-1">
-                Search Radius
-                <span className="text-gray-400 font-normal ml-1">
-                  (default {RADIUS_DEFAULT}km)
-                </span>
-              </label>
-
-              {/* Slider row: [track] [live value] [reset button] */}
-              <div className="flex items-center gap-4">
-                <input
-                  type="range"
-                  min={RADIUS_MIN}
-                  max={RADIUS_MAX}
-                  step="1"
-                  className="flex-1 accent-red-600"
-                  value={form.radiusKm}
-                  onChange={e =>
-                    setForm({ ...form, radiusKm: parseInt(e.target.value) })
-                  }
-                />
-
-                {/* Live readout of the currently selected radius */}
-                <span className="text-sm font-medium text-red-600 w-16 text-center">
-                  {form.radiusKm} km
-                </span>
-
-                {/* Resets radius back to 5km without clearing other fields */}
-                <button
-                  type="button"
-                  onClick={() => setForm({ ...form, radiusKm: RADIUS_DEFAULT })}
-                  className="text-xs text-gray-400 hover:text-gray-600 underline"
-                >
-                  Reset
-                </button>
-              </div>
-
-              {/* Scale labels — absolutely positioned to match actual slider values */}
-              <div className="relative h-4 mt-1 text-xs text-gray-300">
-                {/* 1km — anchored to the left edge */}
-                <span
-                  className="absolute"
-                  style={{ left: `${sliderPercent(1)}%` }}
-                >
-                  1km
-                </span>
-                {/* 5km — centered at 21% */}
-                <span
-                  className="absolute -translate-x-1/2"
-                  style={{ left: `${sliderPercent(5)}%` }}
-                >
-                  5km
-                </span>
-                {/* 10km — centered at 47% */}
-                <span
-                  className="absolute -translate-x-1/2"
-                  style={{ left: `${sliderPercent(10)}%` }}
-                >
-                  10km
-                </span>
-                {/* 20km — anchored to the right edge */}
-                <span
-                  className="absolute -translate-x-full"
-                  style={{ left: `${sliderPercent(20)}%` }}
-                >
-                  20km
-                </span>
-              </div>
-            </div>
-
-            {/* Form Buttons */}
-            <div className="col-span-2 flex gap-3">
-              <button
-                type="submit"
-                className="bg-red-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-red-700 transition"
-              >
-                Submit Request
-              </button>
-              <button
-                type="button"
-                onClick={resetForm}
-                className="border border-gray-200 text-gray-600 px-5 py-2 rounded-lg text-sm hover:bg-gray-50 transition"
-              >
-                Cancel
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* ── Summary Stats ───────────────────────────────────────────────────── */}
-      {/*    Four cards showing request counts by status                        */}
-      <div className="grid grid-cols-4 gap-3 mb-6">
-        {[
-          { label: 'Total Requests', value: stats.total,     color: 'text-gray-900'  },
-          { label: 'Pending',        value: stats.pending,   color: 'text-red-600'   },
-          { label: 'Fulfilled',      value: stats.fulfilled, color: 'text-green-600' },
-          { label: 'Cancelled',      value: stats.cancelled, color: 'text-gray-400'  },
-        ].map(card => (
-          <div
-            key={card.label}
-            className="bg-white border border-gray-200 rounded-xl p-4"
+        {/* Header */}
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900 mb-1">Blood Requests</h1>
+            <p className="text-gray-400 text-sm">Manage and raise blood donation requests</p>
+          </div>
+          <button
+            onClick={() => { setShowForm(!showForm); setError(''); setSuccess('') }}
+            className="flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white font-semibold px-5 py-2.5 rounded-xl transition-all text-sm shadow-lg shadow-red-100"
           >
-            <div className="text-xs text-gray-500 mb-1">{card.label}</div>
-            <div className={`text-2xl font-medium ${card.color}`}>{card.value}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* ── Requests List ───────────────────────────────────────────────────── */}
-      {/*    Shows all requests as rows sorted by most recent first             */}
-      {/*    Each row shows: blood type badge, date, urgency, status, cancel    */}
-      <div className="bg-white border border-gray-200 rounded-xl">
-
-        {/* List header */}
-        <div className="px-5 py-3.5 border-b border-gray-100">
-          <h2 className="text-sm font-medium text-gray-700">Recent Requests</h2>
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            Raise Request
+          </button>
         </div>
 
-        {/* Empty state — shown when no requests exist yet */}
-        {requests.length === 0 ? (
-          <div className="px-5 py-10 text-center text-sm text-gray-400">
-            No requests yet. Raise your first request!
-          </div>
-        ) : (
-          <div className="divide-y divide-gray-50">
-            {requests.map(req => (
-              <div
-                key={req.id}
-                className="px-5 py-4 flex items-center justify-between hover:bg-gray-50 transition"
-              >
-
-                {/* Left: blood type icon + meta info */}
-                <div className="flex items-center gap-4">
-
-                  {/* Blood type badge e.g. "AB+" or "O−" */}
-                  <div className="w-10 h-10 bg-red-50 rounded-xl flex items-center justify-center text-xs font-medium text-red-600">
-                    {btShort(req.bloodType)}
-                  </div>
-
-                  {/* Request title + date + optional notes */}
-                  <div>
-                    <div className="text-sm font-medium text-gray-900">
-                      {req.bloodType} — {req.unitsNeeded} unit{req.unitsNeeded > 1 ? 's' : ''}
-                    </div>
-                    <div className="text-xs text-gray-400 mt-0.5">
-                      {new Date(req.createdAt).toLocaleDateString('en-IN', {
-                        day:    'numeric',
-                        month:  'short',
-                        hour:   '2-digit',
-                        minute: '2-digit',
-                      })}
-                      {/* Append notes inline if present */}
-                      {req.notes && ` · ${req.notes}`}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Right: urgency badge + status badge + cancel button */}
-                <div className="flex items-center gap-2">
-
-                  {/* Urgency badge — color coded by severity */}
-                  <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${urgencyColor(req.urgencyLevel)}`}>
-                    {req.urgencyLevel}
-                  </span>
-
-                  {/* Status badge — shows current lifecycle state */}
-                  <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${statusColor(req.status)}`}>
-                    {req.status}
-                  </span>
-
-                  {/* Cancel button — only available while request is still PENDING */}
-                  {req.status === 'PENDING' && (
-                    <button
-                      onClick={() => cancelRequest(req.id)}
-                      className="text-xs text-red-500 bg-red-50 hover:bg-red-100 px-3 py-1 rounded-full transition"
-                    >
-                      Cancel
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
+        {success && (
+          <div className="bg-green-50 border border-green-200 text-green-700 text-sm px-4 py-3 rounded-xl mb-6 flex items-center gap-2">
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="20 6 9 17 4 12"/></svg>
+            {success}
           </div>
         )}
-      </div>
+        {error && (
+          <div className="bg-red-50 border border-red-200 text-red-600 text-sm px-4 py-3 rounded-xl mb-6">
+            {error}
+          </div>
+        )}
+
+        {showForm && (
+          <div className="bg-white rounded-2xl border border-gray-100 p-6 mb-8">
+            <h2 className="font-semibold text-gray-900 mb-5">New Blood Request</h2>
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1.5">Blood Type</label>
+                  <select name="bloodType" value={form.bloodType} onChange={handleChange}
+                    className="w-full px-3 py-2.5 rounded-xl border border-gray-200 bg-white text-gray-900 focus:outline-none focus:ring-2 focus:ring-red-500 text-sm">
+                    {BLOOD_TYPES.map(b => <option key={b} value={b}>{formatBlood(b)}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1.5">Urgency</label>
+                  <select name="urgencyLevel" value={form.urgencyLevel} onChange={handleChange}
+                    className="w-full px-3 py-2.5 rounded-xl border border-gray-200 bg-white text-gray-900 focus:outline-none focus:ring-2 focus:ring-red-500 text-sm">
+                    <option value="LOW">Low</option>
+                    <option value="MEDIUM">Medium</option>
+                    <option value="HIGH">High</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1.5">Units Needed</label>
+                  <input type="number" name="unitsNeeded" value={form.unitsNeeded} onChange={handleChange}
+                    min="1" max="20" required
+                    className="w-full px-3 py-2.5 rounded-xl border border-gray-200 bg-white text-gray-900 focus:outline-none focus:ring-2 focus:ring-red-500 text-sm"/>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1.5">Radius (km)</label>
+                  <input type="number" name="radiusKm" value={form.radiusKm} onChange={handleChange}
+                    min="1" max="20" required
+                    className="w-full px-3 py-2.5 rounded-xl border border-gray-200 bg-white text-gray-900 focus:outline-none focus:ring-2 focus:ring-red-500 text-sm"/>
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1.5">Notes (optional)</label>
+                <input name="notes" value={form.notes} onChange={handleChange}
+                  placeholder="Any additional information for donors..."
+                  className="w-full px-3 py-2.5 rounded-xl border border-gray-200 bg-white text-gray-900 placeholder-gray-300 focus:outline-none focus:ring-2 focus:ring-red-500 text-sm"/>
+              </div>
+              <div className="flex gap-3 pt-2">
+                <button type="submit" disabled={submitting}
+                  className="bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white font-semibold px-6 py-2.5 rounded-xl text-sm transition-all">
+                  {submitting ? 'Sending notifications...' : 'Raise & Notify Donors'}
+                </button>
+                <button type="button" onClick={() => setShowForm(false)}
+                  className="text-gray-500 hover:text-gray-700 border border-gray-200 px-6 py-2.5 rounded-xl text-sm transition-all">
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+          {[
+            { label: 'Total',     value: counts.total,     color: 'text-gray-900' },
+            { label: 'Pending',   value: counts.pending,   color: 'text-blue-600' },
+            { label: 'Fulfilled', value: counts.fulfilled, color: 'text-green-600' },
+            { label: 'Cancelled', value: counts.cancelled, color: 'text-gray-400' },
+          ].map(s => (
+            <div key={s.label} className="bg-white rounded-2xl p-5 border border-gray-100">
+              <div className="text-xs text-gray-400 font-medium mb-2">{s.label}</div>
+              <div className={`text-3xl font-bold ${s.color}`}>{s.value}</div>
+            </div>
+          ))}
+        </div>
+
+        <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+          {loading ? (
+            <div className="flex items-center justify-center py-20">
+              <svg className="w-6 h-6 animate-spin text-red-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+              </svg>
+            </div>
+          ) : requests.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-20 text-gray-300">
+              <svg className="w-12 h-12 mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <path d="M12 21C12 21 4 14.5 4 9.5C4 7.01 5.79 4 8.5 4C10.09 4 11.28 4.93 12 6.09C12.72 4.93 13.91 4 15.5 4C18.21 4 20 7.01 20 9.5C20 14.5 12 21 12 21Z"/>
+              </svg>
+              <p className="text-sm">No requests yet. Raise your first request.</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-gray-50">
+              {requests.map(r => (
+                <div key={r.id} className="p-6 hover:bg-gray-50/50 transition-colors">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-3 flex-wrap">
+                        <span className={`text-xs font-semibold px-2.5 py-1 rounded-lg border ${URGENCY_COLORS[r.urgencyLevel]}`}>
+                          {r.urgencyLevel}
+                        </span>
+                        <span className="text-xs font-bold text-red-600 bg-red-50 px-2.5 py-1 rounded-lg border border-red-200">
+                          {formatBlood(r.bloodType)}
+                        </span>
+                        <span className={`text-xs font-semibold px-2.5 py-1 rounded-lg border ${STATUS_COLORS[r.status]}`}>
+                          {r.status}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-4 text-xs text-gray-400 flex-wrap">
+                        <span className="flex items-center gap-1">
+                          <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+                          </svg>
+                          {formatDate(r.createdAt)}
+                        </span>
+                        <span>{r.unitsNeeded} units needed</span>
+                        {r.notes && <span className="italic">"{r.notes}"</span>}
+                      </div>
+                    </div>
+                    {r.status === 'PENDING' && (
+                      <button
+                        onClick={() => cancelRequest(r.id)}
+                        disabled={cancelling === r.id}
+                        className="text-xs text-gray-400 hover:text-red-600 border border-gray-200 hover:border-red-200 px-4 py-2 rounded-xl transition-all disabled:opacity-50"
+                      >
+                        {cancelling === r.id ? '...' : 'Cancel'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </main>
     </div>
   )
 }
